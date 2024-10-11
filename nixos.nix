@@ -2,40 +2,40 @@
 
 let
   inherit (lib)
+    all
+    any
     attrNames
     attrValues
-    zipAttrsWith
+    catAttrs
+    concatMap
+    concatMapStrings
+    concatMapStringsSep
+    concatStringsSep
+    elem
+    escapeShellArg
+    escapeShellArgs
+    filter
+    filterAttrs
     flatten
+    foldl'
+    hasPrefix
+    id
+    intersectLists
+    listToAttrs
+    literalExpression
+    mapAttrs
+    mapAttrsToList
     mkAfter
-    mkOption
     mkDefault
     mkIf
     mkMerge
-    mapAttrsToList
-    types
-    foldl'
-    unique
-    concatMap
-    concatMapStrings
-    listToAttrs
-    escapeShellArg
-    escapeShellArgs
-    recursiveUpdate
-    all
-    filter
-    filterAttrs
-    concatStringsSep
-    concatMapStringsSep
-    catAttrs
+    mkOption
     optional
     optionalString
-    literalExpression
-    elem
-    mapAttrs
-    intersectLists
-    any
-    id
-    head
+    pipe
+    types
+    unique
+    zipAttrsWith
     ;
 
   inherit (utils)
@@ -52,16 +52,11 @@ let
 
   scripts = pkgs.callPackage ./scripts { };
 
-  cfg = config.environment.persistence;
+  cfg = config.impermanence;
+  cfgs = config.environment.persistence;
   users = config.users.users;
-  allPersistentStoragePaths = zipAttrsWith (_name: flatten) (filter (v: v.enable) (attrValues cfg));
+  allPersistentStoragePaths = zipAttrsWith (_name: flatten) (filter (v: v.enable) (attrValues cfgs));
   inherit (allPersistentStoragePaths) files directories;
-
-  defaultPerms = {
-    mode = "0755";
-    user = "root";
-    group = "root";
-  };
 
   # Create fileSystems bind mount entry.
   mkBindMountNameValuePair = { dirPath, persistentStoragePath, hideMount, ... }: {
@@ -78,9 +73,163 @@ let
   # Create all fileSystems bind mount entries for a specific
   # persistent storage path.
   bindMounts = listToAttrs (map mkBindMountNameValuePair directories);
+
+  systemMountPoints = builtins.map (fs: fs.mountPoint) (builtins.attrValues config.fileSystems);
+  getMountDependencies = persistentStoragePath: mountPath:
+    let
+      toMountUnit = path: "${escapeSystemdPath path}.mount";
+      persistentPath = concatPaths [ persistentStoragePath mountPath ];
+      getParentMount = path:
+        let dir = dirOf path; in pipe systemMountPoints [
+          (builtins.filter (mountPoint: hasPrefix mountPoint dir))
+          (builtins.sort builtins.lessThan)
+          lib.lists.last
+        ];
+      persistentParent = getParentMount persistentPath;
+      mountParent = getParentMount mountPath;
+      parent = dirOf mountPath;
+    in
+    rec {
+      persistentPaths = [ persistentParent ];
+      mountPaths = [ mountParent ];
+      mountServices = [ "${mkCreateDirectoryUnitName parent persistentStoragePath}.service" ];
+      persistentUnits = builtins.map toMountUnit persistentPaths;
+      mountUnits = builtins.map toMountUnit mountPaths ++ mountServices;
+    };
+
+  # The parent directories of files.
+  fileDirs = unique (catAttrs "parentDirectory" files);
+
+  # All the directories actually listed by the user and the
+  # parent directories of listed files.
+  explicitDirectories = directories ++ fileDirs;
+
+  # Home directories have to be handled specially, since
+  # they're at the permissions boundary where they
+  # themselves should be owned by the user and have stricter
+  # permissions than regular directories, whereas its parent
+  # should be owned by root and have regular permissions.
+  #
+  # This simply collects all the home directories and sets
+  # the appropriate permissions and ownership.
+  homeDirectories =
+    foldl'
+      (state: dir:
+        let
+          defaultPerms = {
+            mode = cfg.userDefaultPerms.mode;
+            user = "root";
+            group = "root";
+          };
+          homeDir = {
+            directory = dir.home;
+            dirPath = dir.home;
+            home = null;
+            mode = cfg.userDefaultPerms.mode;
+            user = dir.user;
+            group = users.${dir.user}.group;
+            inherit defaultPerms;
+            inherit (dir) persistentStoragePath enableDebugging;
+          };
+        in
+        if dir.home != null then
+          if !(elem homeDir state) then
+            state ++ [ homeDir ]
+          else
+            state
+        else
+          state
+      )
+      [ ]
+      explicitDirectories;
+
+  # Generate entries for all parent directories of the
+  # argument directories, listed in the order they need to
+  # be created. The parent directories are assigned default
+  # permissions.
+  mkParentDirectories = dirs:
+    let
+      # Create a new directory item from `dir`, the child
+      # directory item to inherit properties from and
+      # `path`, the parent directory path.
+      mkParent = dir: path: {
+        directory = path;
+        dirPath =
+          if dir.home != null then
+            concatPaths [ dir.home path ]
+          else
+            path;
+        inherit (dir) persistentStoragePath home enableDebugging;
+        inherit (dir.defaultPerms) user group mode;
+      };
+      # Create new directory items for all parent
+      # directories of a directory.
+      mkParents = dir:
+        map (mkParent dir) (parentsOf dir.directory);
+    in
+    unique (flatten (map mkParents dirs));
+
+  # Parent directories of home folders. This is usually only
+  # /home, unless the user's home is in a non-standard
+  # location.
+  homeDirectoriesParents = mkParentDirectories homeDirectories;
+
+  # Parent directories of all explicitly listed directories.
+  explicitParentDirectories = mkParentDirectories explicitDirectories;
+
+  # All directories in the order they should be created.
+  allDirectories = builtins.concatLists [
+    homeDirectoriesParents
+    homeDirectories
+    explicitParentDirectories
+    explicitDirectories
+  ];
+
+  mkCommandDirWithPerms =
+    { dirPath
+    , persistentStoragePath
+    , user
+    , group
+    , mode
+    , ...
+    }:
+    escapeShellArgs [
+      (lib.getExe scripts.os.create-directories)
+      persistentStoragePath
+      dirPath
+      user
+      group
+      mode
+    ];
+
+  mkCommandPersistFile = { filePath, persistentStoragePath, ... }:
+    let
+      mountPoint = filePath;
+      targetFile = concatPaths [ persistentStoragePath filePath ];
+    in
+    escapeShellArgs [
+      (lib.getExe scripts.os.mount-file)
+      mountPoint
+      targetFile
+    ];
+
+  mkCreateDirectoryUnitName = path: persistentStoragePath: "impermanence-mkdir--${escapeSystemdPath persistentStoragePath}--${escapeSystemdPath path}";
 in
 {
   options = {
+
+    impermanence.activationScriptsEnable = mkOption {
+      type = with types; bool;
+      default = true;
+    };
+    impermanence.userDefaultPerms.mode = mkOption {
+      type = with types; str;
+      default = "0755";
+    };
+    impermanence.defaultPerms.mode = mkOption {
+      type = with types; str;
+      default = "0755";
+    };
 
     environment.persistence = mkOption {
       default = { };
@@ -101,6 +250,11 @@ in
           submodule (
             { name, config, ... }:
             let
+              defaultPerms = {
+                mode = cfg.defaultPerms.mode;
+                user = "root";
+                group = "root";
+              };
               commonOpts = {
                 options = {
                   persistentStoragePath = mkOption {
@@ -261,7 +415,7 @@ in
                         { name, config, ... }:
                         let
                           userDefaultPerms = {
-                            inherit (defaultPerms) mode;
+                            mode = cfg.userDefaultPerms.mode;
                             user = name;
                             group = users.${userDefaultPerms.user}.group;
                           };
@@ -272,7 +426,7 @@ in
                                 directory = dirOf config.file;
                                 dirPath = concatPaths [ config.home directory ];
                                 inherit (config) persistentStoragePath home;
-                                defaultPerms = userDefaultPerms;
+                                defaultPerms = mkDefault userDefaultPerms;
                               };
                               filePath = concatPaths [ config.home config.file ];
                             };
@@ -489,26 +643,35 @@ in
     virtualisation.fileSystems = mkOption { };
   };
 
-  config = mkIf (allPersistentStoragePaths != { }) {
+  config = mkIf (allPersistentStoragePaths != { }) (mkMerge [{
+    systemd.targets.impermanence-mounts = {
+      description = "nix/impermanence: all mounts finished";
+      wantedBy = [ "default.target" ];
+    };
+
     systemd.services =
       let
         mkPersistFileService = { filePath, persistentStoragePath, enableDebugging, ... }:
           let
             targetFile = concatPaths [ persistentStoragePath filePath ];
             mountPoint = escapeShellArg filePath;
+            deps = getMountDependencies persistentStoragePath filePath;
           in
           {
             "persist-${escapeSystemdPath (escapeShellArg targetFile)}" = {
-              description = "Bind mount or link ${escapeShellArg targetFile} to ${mountPoint}";
-              wantedBy = [ "local-fs.target" ];
-              before = [ "local-fs.target" ];
+              description = "nix/impermanence: bind mount or link ${escapeShellArg targetFile} to ${mountPoint}";
+              before = [ "impermanence-mounts.target" ];
+              requiredBy = [ "impermanence-mounts.target" ];
+              wantedBy = deps.mountUnits;
+              wants = deps.persistentUnits;
+              after = deps.mountUnits ++ deps.persistentUnits;
               path = [ pkgs.util-linux ];
               unitConfig.DefaultDependencies = false;
               environment.DEBUG = builtins.toString enableDebugging;
               serviceConfig = {
                 Type = "oneshot";
                 RemainAfterExit = true;
-                ExecStart = "${lib.getExe scripts.os.mount-file} ${mountPoint} ${escapeShellArg targetFile}";
+                ExecStart = mkCommandPersistFile { inherit filePath persistentStoragePath; };
                 ExecStop = pkgs.writeShellScript "unbindOrUnlink-${escapeSystemdPath (escapeShellArg targetFile)}" ''
                   set -eu
                   if [[ -L ${mountPoint} ]]; then
@@ -521,188 +684,64 @@ in
               };
             };
           };
+        mkDirectoryService = { dirPath, persistentStoragePath, enableDebugging, ... }@dirCfg:
+          let
+            deps = getMountDependencies persistentStoragePath dirPath;
+          in
+          {
+            "${mkCreateDirectoryUnitName dirPath persistentStoragePath}" = {
+              description = "nix/impermanence: create ${escapeShellArg dirPath} directory inside ${escapeShellArg dirPath}";
+              before = [ "impermanence-mounts.target" ];
+              requiredBy = [ "impermanence-mounts.target" ];
+              wantedBy = deps.mountUnits;
+              wants = deps.persistentUnits;
+              after = deps.mountUnits ++ deps.persistentUnits;
+              unitConfig.DefaultDependencies = false;
+              environment.DEBUG = builtins.toString enableDebugging;
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ExecStart = mkCommandDirWithPerms dirCfg;
+              };
+            };
+          };
+
+        allServiceDirectories = pipe allDirectories [
+          (builtins.filter (dirCfg: !(lib.strings.hasSuffix "/." dirCfg.dirPath)))
+        ];
       in
-      foldl' recursiveUpdate { } (map mkPersistFileService files);
+      mkMerge (
+        [ ]
+        ++ map mkDirectoryService allServiceDirectories
+        ++ map mkPersistFileService files
+      );
 
     fileSystems = mkIf (directories != [ ]) bindMounts;
     # So the mounts still make it into a VM built from `system.build.vm`
     virtualisation.fileSystems = mkIf (directories != [ ]) bindMounts;
 
-    system.activationScripts =
-      let
-        mkDirWithPerms =
-          { dirPath
-          , persistentStoragePath
-          , user
-          , group
-          , mode
-          , enableDebugging
-          , ...
-          }:
-          let
-            args = [
-              persistentStoragePath
-              dirPath
-              user
-              group
-              mode
-            ];
-          in
-          ''
-            DEBUG=${builtins.toString enableDebugging} ${lib.getExe scripts.os.create-directories} ${escapeShellArgs args}
-          '';
-
+    system.activationScripts = lib.mkIf cfg.activationScriptsEnable {
+      "impermanenceCreatePersistentStorageDirs" = {
+        deps = [ "users" "groups" ];
         # Build an activation script which creates all persistent
         # storage directories we want to bind mount.
-        dirCreationScript =
-          let
-            # The parent directories of files.
-            fileDirs = unique (catAttrs "parentDirectory" files);
-
-            # All the directories actually listed by the user and the
-            # parent directories of listed files.
-            explicitDirs = directories ++ fileDirs;
-
-            # Home directories have to be handled specially, since
-            # they're at the permissions boundary where they
-            # themselves should be owned by the user and have stricter
-            # permissions than regular directories, whereas its parent
-            # should be owned by root and have regular permissions.
-            #
-            # This simply collects all the home directories and sets
-            # the appropriate permissions and ownership.
-            homeDirs =
-              foldl'
-                (state: dir:
-                  let
-                    homeDir = {
-                      directory = dir.home;
-                      dirPath = dir.home;
-                      home = null;
-                      mode = "0700";
-                      user = dir.user;
-                      group = users.${dir.user}.group;
-                      inherit defaultPerms;
-                      inherit (dir) persistentStoragePath enableDebugging;
-                    };
-                  in
-                  if dir.home != null then
-                    if !(elem homeDir state) then
-                      state ++ [ homeDir ]
-                    else
-                      state
-                  else
-                    state
-                )
-                [ ]
-                explicitDirs;
-
-            # Persistent storage directories. These need to be created
-            # unless they're at the root of a filesystem.
-            persistentStorageDirs =
-              foldl'
-                (state: dir:
-                  let
-                    persistentStorageDir = {
-                      directory = dir.persistentStoragePath;
-                      dirPath = dir.persistentStoragePath;
-                      persistentStoragePath = "";
-                      home = null;
-                      inherit (dir) defaultPerms enableDebugging;
-                      inherit (dir.defaultPerms) user group mode;
-                    };
-                  in
-                  if dir.home == null && !(elem persistentStorageDir state) then
-                    state ++ [ persistentStorageDir ]
-                  else
-                    state
-                )
-                [ ]
-                (explicitDirs ++ homeDirs);
-
-            # Generate entries for all parent directories of the
-            # argument directories, listed in the order they need to
-            # be created. The parent directories are assigned default
-            # permissions.
-            mkParentDirs = dirs:
-              let
-                # Create a new directory item from `dir`, the child
-                # directory item to inherit properties from and
-                # `path`, the parent directory path.
-                mkParent = dir: path: {
-                  directory = path;
-                  dirPath =
-                    if dir.home != null then
-                      concatPaths [ dir.home path ]
-                    else
-                      path;
-                  inherit (dir) persistentStoragePath home enableDebugging;
-                  inherit (dir.defaultPerms) user group mode;
-                };
-                # Create new directory items for all parent
-                # directories of a directory.
-                mkParents = dir:
-                  map (mkParent dir) (parentsOf dir.directory);
-              in
-              unique (flatten (map mkParents dirs));
-
-            persistentStorageDirParents = mkParentDirs persistentStorageDirs;
-
-            # Parent directories of home folders. This is usually only
-            # /home, unless the user's home is in a non-standard
-            # location.
-            homeDirParents = mkParentDirs homeDirs;
-
-            # Parent directories of all explicitly listed directories.
-            parentDirs = mkParentDirs explicitDirs;
-
-            # All directories in the order they should be created.
-            allDirs =
-              persistentStorageDirParents
-              ++ persistentStorageDirs
-              ++ homeDirParents
-              ++ homeDirs
-              ++ parentDirs
-              ++ explicitDirs;
-          in
-          pkgs.writeShellScript "impermanence-run-create-directories" ''
-            _status=0
-            trap "_status=1" ERR
-            ${concatMapStrings mkDirWithPerms allDirs}
-            exit $_status
-          '';
-
-        mkPersistFile = { filePath, persistentStoragePath, enableDebugging, ... }:
-          let
-            mountPoint = filePath;
-            targetFile = concatPaths [ persistentStoragePath filePath ];
-            args = escapeShellArgs [
-              mountPoint
-              targetFile
-            ];
-          in
-          ''
-            ${lib.getExe scripts.os.mount-file} ${args}
-          '';
-
-        persistFileScript =
-          pkgs.writeShellScript "impermanence-persist-files" ''
-            _status=0
-            trap "_status=1" ERR
-            ${concatMapStrings mkPersistFile files}
-            exit $_status
-          '';
-      in
-      {
-        "impermanenceCreatePersistentStorageDirs" = {
-          deps = [ "users" "groups" ];
-          text = "${dirCreationScript}";
-        };
-        "impermanencePersistFiles" = {
-          deps = [ "impermanenceCreatePersistentStorageDirs" ];
-          text = "${persistFileScript}";
-        };
+        text = builtins.toString (pkgs.writeShellScript "impermanence-run-create-directories" ''
+          _status=0
+          trap "_status=1" ERR
+          ${concatMapStrings (dir: "DEBUG=${builtins.toString dir.enableDebugging} ${mkCommandDirWithPerms dir}\n") allDirectories}
+          exit $_status
+        '');
       };
+      "impermanencePersistFiles" = {
+        deps = [ "impermanenceCreatePersistentStorageDirs" ];
+        text = builtins.toString (pkgs.writeShellScript "impermanence-persist-files" ''
+          _status=0
+          trap "_status=1" ERR
+          ${concatMapStrings (file: "DEBUG=${builtins.toString file.enableDebugging} ${mkCommandPersistFile file}\n") files}
+          exit $_status
+        '');
+      };
+    };
 
     # Create the mountpoints of directories marked as needed for boot
     # which are also persisted. For this to work, it has to run at
@@ -775,7 +814,7 @@ in
             config.fileSystems.${fs}.neededForBoot == cond
           else
             cond;
-        persistentStoragePaths = attrNames cfg;
+        persistentStoragePaths = attrNames cfgs;
         usersPerPath = allPersistentStoragePaths.users;
         homeDirOffenders =
           filterAttrs
@@ -887,6 +926,6 @@ in
             ''
           ])
         ]);
-  };
+  }]);
 
 }
