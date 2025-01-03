@@ -47,7 +47,7 @@ let
     concatPaths
     duplicates
     parentsOf
-    splitPath
+    isParentOf
     ;
 
   scripts = pkgs.callPackage ./scripts { };
@@ -132,6 +132,7 @@ let
                 directory = dirCfg.home;
                 dirPath = dirCfg.home;
                 home = null;
+                isHomeDir = true;
                 inherit (defaultPerms)
                   mode
                   user
@@ -162,7 +163,7 @@ let
           # `path`, the parent directory path.
           mkParent = dirCfg: path: {
             directory = path;
-            dirPath = concatPaths (lib.lists.optional (dirCfg.home != null) dirCfg.home ++ [ path ]);
+            dirPath = path;
             inherit (dirCfg)
               persistentStoragePath
               home
@@ -174,7 +175,17 @@ let
               group
               mode
               ;
+          } // lib.optionalAttrs (dirCfg.home != null) {
+            dirPath = concatPaths [ dirCfg.home path ];
+          } // lib.optionalAttrs ((dirCfg.isHomeDir or false) && isParentOf path dirCfg.dirPath) {
+            # make /home consistently owned by root
+            inherit (cfg.homeParentPerms)
+              user
+              group
+              mode
+              ;
           };
+
           # Create new directory items for all parent
           # directories of a directory.
           mkParents = dirCfg:
@@ -238,9 +249,31 @@ in
       type = with types; str;
       default = "0755";
     };
+
     impermanence.defaultPerms.mode = mkOption {
       type = with types; str;
       default = "0755";
+    };
+    impermanence.defaultPerms.user = mkOption {
+      type = with types; str;
+      default = "root";
+    };
+    impermanence.defaultPerms.group = mkOption {
+      type = with types; str;
+      default = "root";
+    };
+
+    impermanence.homeParentPerms.mode = mkOption {
+      type = with types; str;
+      default = cfg.defaultPerms.mode;
+    };
+    impermanence.homeParentPerms.user = mkOption {
+      type = with types; str;
+      default = cfg.defaultPerms.user;
+    };
+    impermanence.homeParentPerms.group = mkOption {
+      type = with types; str;
+      default = "users";
     };
 
     environment.persistence = mkOption {
@@ -263,11 +296,7 @@ in
             { name, ... }@persistenceArgs:
             let
               persistenceCfg = persistenceArgs.config;
-              defaultPerms = {
-                mode = cfg.defaultPerms.mode;
-                user = "root";
-                group = "root";
-              };
+              defaultPerms = cfg.defaultPerms;
               commonOpts = {
                 options = {
                   persistentStoragePath = mkOption {

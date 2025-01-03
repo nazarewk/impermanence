@@ -1,29 +1,31 @@
 { lib }:
 let
   inherit (lib)
-    filter
     concatMap
     concatStringsSep
+    elem
+    filter
+    foldl'
     hasPrefix
     head
-    replaceStrings
+    last
+    length
     optionalString
     removePrefix
-    foldl'
-    elem
+    replaceStrings
     take
-    length
-    last
+    toList
     ;
   inherit (lib.strings)
     sanitizeDerivationName
     ;
 
   # ["/home/user/" "/.screenrc"] -> ["home" "user" ".screenrc"]
+  # "/home/user/.screenrc" -> ["home" "user" ".screenrc"]
   splitPath = paths:
     (filter
       (s: builtins.typeOf s == "string" && s != "")
-      (concatMap (builtins.split "/") paths)
+      (concatMap (builtins.split "/") (toList paths))
     );
 
   # ["home" "user" ".screenrc"] -> "home/user/.screenrc"
@@ -54,6 +56,9 @@ let
         ])
       [ ]
       parents;
+
+  isParentOf = parent: child:
+    child != parent && lib.lists.hasPrefix (splitPath parent) (splitPath child);
 
   sanitizeName = name:
     replaceStrings
@@ -120,6 +125,7 @@ in
     dirListToPath
     duplicates
     getHomeDirCfg
+    isParentOf
     parentsOf
     sanitizeName
     splitPath
